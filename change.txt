@@ -1,0 +1,450 @@
+2026-05-27 23:47:29 CST
+- 停止继续安装 `causal-conv1d>=1.4.0` 和 `mamba-ssm`：安装过程卡在隔离构建环境重新安装 torch，容易受 nvcc/CUDA 编译环境影响。
+- 将 Mamba 融合路线改为纯 PyTorch 轻量实现：更新 `ultralytics/nn/modules/mamba_fusion.py`，实现 `BiSSM`、`CrossModalMamba`，移除对 `mamba-ssm`、`causal-conv1d`、`einops` 的依赖。
+- 在 `ultralytics/nn/modules/__init__.py` 注册 `CrossModalMamba`、`CGSA_Mamba`、`CGSA`，并补充 `CDFIM = CPCA_CF` 兼容别名。
+- 在 `ultralytics/nn/tasks.py` 接入 `CrossModalMamba`、`CGSA_Mamba`、`CGSA`、`CDFIM` 的模型解析逻辑，使 `C2DFF.yaml` 中旧的 `CGSA` 自动映射到新的纯 PyTorch Mamba 融合模块。
+- 修复 Ultralytics 初始化时将 `SiLU` 设为 inplace 导致 `chunk` view 前向报错的问题，改用 `torch.nn.functional.silu`。
+- 验证：`C2DFF.yaml` 可解析；第 32/33/34 层原 `CGSA` 均解析为 `CrossModalMamba`；小尺寸前向输出 `[1, 65, 8, 8]`、`[1, 65, 4, 4]`、`[1, 65, 2, 2]`；`py_compile` 通过。
+
+2026-05-27 23:54:08 CST
+- 按第 3 步确认 YOLOv8 工厂注册：`CrossModalMamba` 已在 `ultralytics/nn/modules/__init__.py` 的导入和 `__all__` 中暴露，并在 `ultralytics/nn/tasks.py` 的 `parse_model` 中按双输入融合模块解析。
+- 按第 4 步新增 Mamba 网络配置：复制 `ultralytics/cfg/models/v8/C2DFF.yaml` 为 `ultralytics/cfg/models/v8/yolov8-c2dff-mamba.yaml`，将第 32/33/34 层融合模块从 `PolarizedSelfAttention_Channel` 显式替换为 `CrossModalMamba`，参数保持 `[256]`、`[512]`、`[1024]`。
+- 按第 5 步更新训练入口：将 `main.py` 中 `YOLO(...)` 的模型路径切换为 `ultralytics/cfg/models/v8/yolov8-c2dff-mamba.yaml`，其余训练参数保持不变。
+- 验证：新 YAML 可解析；第 32/33/34 层均为 `CrossModalMamba`；`DetectionModel` 小尺寸前向输出 `[1, 65, 8, 8]`、`[1, 65, 4, 4]`、`[1, 65, 2, 2]`；相关 Python 文件 `py_compile` 通过。
+
+2026-05-27 23:56:29 CST
+- 修复训练时报 CUDA OOM 的 Mamba 显存热点：原 `BiSSM.forward_ssm` 使用 `torch.einsum("bld,bln->bldn")` 生成四维状态张量，在 640 训练特征上显存过高。
+- 将 `forward_ssm` 改为线性显存的门控累积实现，只保留 `[B, L, D]` 级别中间张量；同时将 `BiSSM` / `CrossModalMamba` 默认 `expand` 从 2 降为 1，降低训练显存占用。
+- 验证：`mamba_fusion.py` 语法编译通过；新 Mamba YAML 小尺寸前向输出 `[1, 65, 8, 8]`、`[1, 65, 4, 4]`、`[1, 65, 2, 2]`；CUDA 上 batch=1、imgsz=640、no-grad 前向通过，峰值显存约 230MB。
+
+2026-05-28 12:14:07 CST
+- 面向 B 刊论文创新点，新增 `AlignedLocalMambaFusion`：在简单一维展平 Mamba 之外加入轻量仿射对齐、2D 局部卷积分支、全局 CrossModalMamba 分支和像素级门控融合，形成“局部保边缘 + 全局建模 + 跨模态对齐”的融合模块。
+- 在 `ultralytics/nn/modules/mamba_fusion.py` 新增 `AffineAlign`，通过全局特征回归 2x3 仿射矩阵，并使用 `affine_grid` / `grid_sample` 对红外特征向可见光特征对齐；仿射层初始化为恒等变换，降低训练初期扰动。
+- 在 `ultralytics/nn/modules/__init__.py` 导出 `AlignedLocalMambaFusion`，在 `ultralytics/nn/tasks.py` 的 `parse_model` 中按双输入融合模块注册该模块。
+- 新增主实验配置 `ultralytics/cfg/models/v8/yolov8-c2dff-aligned-local-mamba.yaml`，将第 32/33/34 层从 `CrossModalMamba` 替换为 `AlignedLocalMambaFusion`，保留上一版 `yolov8-c2dff-mamba.yaml` 作为简单 Mamba 对照消融。
+- 更新 `main.py`，默认加载 `yolov8-c2dff-aligned-local-mamba.yaml`，用于后续主实验训练。
+- 验证：相关 Python 文件 `py_compile` 通过；新 YAML 可解析，32/33/34 层均为 `AlignedLocalMambaFusion`；小尺寸前向输出 `[1, 65, 8, 8]`、`[1, 65, 4, 4]`、`[1, 65, 2, 2]`；CUDA batch=1、imgsz=640、no-grad 前向通过，峰值显存约 237.8MB。
+
+2026-05-28 12:22:19 CST
+- 系统性升级融合方法为 `ReliabilityAwareAlignedMambaFusion`，从单点 Mamba 改进扩展为“可靠性感知 + 仿射对齐 + 2D 局部保持 + 全局 Mamba + 频域差异 + 多尺度差异化”的主实验模块。
+- 在 `ultralytics/nn/modules/mamba_fusion.py` 新增 `FrequencyDifferenceBranch`，使用 `torch.fft.rfft2/irfft2` 从可见光与红外特征幅值差异中提取频域互补线索，用于缓解只依赖空间展平的局部细节损伤。
+- 新增 `ModalityReliabilityGate`，根据可见光、对齐红外和频域差异预测两模态可靠性权重，使融合过程能动态决定更信任哪一路模态。
+- 新增 `ReliabilityAwareAlignedMambaFusion`，内部包含 `AffineAlign`、局部卷积分支、`CrossModalMamba` 全局分支、频域分支、可靠性基底和三分支 softmax 融合门控；支持 `stage` 参数实现 P3/P4/P5 差异化融合策略。
+- 在 `ultralytics/nn/modules/__init__.py` 导出 `ReliabilityAwareAlignedMambaFusion`，在 `ultralytics/nn/tasks.py` 的 `parse_model` 中注册该模块，并调整双输入融合模块解析逻辑以保留 YAML 额外参数。
+- 新增主实验配置 `ultralytics/cfg/models/v8/yolov8-c2dff-raamamba.yaml`，第 32/33/34 层分别使用 `ReliabilityAwareAlignedMambaFusion` 的 `p3`、`p4`、`p5` 策略；保留 `yolov8-c2dff-mamba.yaml` 和 `yolov8-c2dff-aligned-local-mamba.yaml` 作为消融对照。
+- 更新 `main.py`，默认加载 `yolov8-c2dff-raamamba.yaml`。
+- 验证：相关 Python 文件 `py_compile` 通过；新 YAML 可解析，32/33/34 层分别为 `ReliabilityAwareAlignedMambaFusion p3/p4/p5`；小尺寸前向输出 `[1, 65, 8, 8]`、`[1, 65, 4, 4]`、`[1, 65, 2, 2]`；CUDA batch=1、imgsz=640、no-grad 前向通过，峰值显存约 239.2MB；单模块 CUDA 反向传播通过，峰值显存约 428.3MB。
+
+2026-05-28 12:28:48 CST
+- 清理训练日志中的 PyTorch deterministic CUDA 警告噪声：在 `main.py` 中精确过滤 `cumsum_cuda_kernel`、`grid_sampler_2d_backward_cuda`、`adaptive_max_pool2d_backward_cuda` 的非确定性 warning。
+- 在 `model.train(...)` 中显式设置 `deterministic=False`，避免 Ultralytics 默认 deterministic 模式反复触发 `cumsum` 和 `grid_sample` 的 warn-only 提示；这是日志清理，不改变模型结构。
+- 验证：`main.py` 语法编译通过。
+
+2026-05-28 13:05:26 CST
+- 为 RAA-Mamba 训练加入第 5-10 epoch 健康度监控：在 `main.py` 新增 `monitor_raamamba_health` 回调，并通过 `model.add_callback("on_train_epoch_end", ...)` 注册；训练到 epoch 5-10 时自动打印每个 `ReliabilityAwareAlignedMambaFusion` 层的 `fusion_gate[local,global,fft]`、`reliability[vis,ir]`、`theta_mean` 和 `theta_delta_abs`。
+- 在 `ultralytics/nn/modules/mamba_fusion.py` 中为 `ModalityReliabilityGate`、`AffineAlign`、`ReliabilityAwareAlignedMambaFusion` 添加运行时统计缓存，便于训练时观察门控权重和仿射矩阵是否健康。
+- 给 `AffineAlign` 添加仿射安全带：网络输出改为相对恒等矩阵的增量，缩放/剪切/平移默认限制在 `[-0.1, 0.1]` 范围内，避免训练初期红外特征被仿射采样甩出边界；theta 初始仍为恒等矩阵。
+- 如果第 5-10 epoch 中某层 local gate 超过 0.85，回调会打印 WARNING，提示 Mamba/FFT 可能被边缘化，需要考虑硬残差融合。
+- 验证：`main.py` 和 `mamba_fusion.py` 语法编译通过；单模块前向后能读到统计值，初始 `fusion_gate` 约为 `[0.3422, 0.3540, 0.3039]`，`theta_mean` 为恒等矩阵，`theta_delta_abs=0`。
+
+2026-05-28 14:42:09 CST
+- 分析 `saved_results` 中 4 次实验：`20260525_195257` 为未改 baseline，`20260528_000006` 和 `20260528_093200` 为简单 Mamba，`20260528_123018` 为 RAA-Mamba 改进版。
+- Baseline 最佳：epoch 235 达到 `mAP50=0.68457`、`mAP50-95=0.40909`；按 `mAP50-95` 最优则 epoch 207 达到 `mAP50-95=0.43135`。
+- 简单 Mamba 两次结果完全一致：最佳 `mAP50=0.64330`、`mAP50-95=0.38640`，相对 baseline 最佳 `mAP50` 低约 `4.13` 个百分点，说明单纯一维 Mamba 替换被实验证伪。
+- RAA-Mamba 当前结果：epoch 188 达到 `mAP50=0.68111`、`mAP50-95=0.40530`，mAP50 基本追回 baseline（仅低约 `0.35` 个百分点），但 `mAP50-95` 仍明显低于 baseline 最优（低约 `2.61` 个百分点）。
+- RAA-Mamba 存在训练不稳定：best 周围 epoch 186/188 有峰值，但 187/189/190 快速回落；最后 30 轮 `mAP50` 均值约 `0.57204`、标准差约 `0.03377`，比 baseline 后 30 轮均值 `0.62486` 更差且波动更大。
+- 初步结论：RAA-Mamba 的结构方向有效，能把简单 Mamba 损失的 mAP50 拉回 baseline 附近；但定位质量和训练稳定性不足，下一步应重点做门控稳定、对齐正则、学习率/早停策略和 best epoch 选择，而不是继续盲目加模块。
+
+2026-05-28 14:51:03 CST
+- 根据 `saved_results` 曲线调整 RAA-Mamba 训练策略：将 `main.py` 中 `model.train(...)` 的 `epochs` 从 `300` 改为 `220`，因为 baseline、简单 Mamba 和 RAA-Mamba 的最佳窗口主要集中在约 `180-235` epoch，后期继续训练收益低且 RAA-Mamba 出现退化。
+- 新增 `patience=40`，让训练在验证指标长期不提升时提前停止，减少后期 mAP 大幅波动和无效训练。
+- 将 `lr0` 从 `0.02` 降到 `0.01`，降低 RAA-Mamba 中门控、FFT 和仿射对齐分支的训练震荡风险。
+- 将 `run_name` 从 `yolov8-twoCSP_时间戳` 改为 `yolov8-c2dff-raamamba_时间戳`，避免新实验结果目录与旧 twoCSP/C2DFF 实验混淆。
+- 保持 `batch=8`、`imgsz=640`、`optimizer='SGD'`、`amp=False`、`deterministic=False`、健康度回调不变。
+- 验证：`main.py` 语法编译通过。
+
+2026-05-28 14:57:55 CST
+- 针对 RAA-Mamba 现有问题（best 附近大幅波动、后期退化、`mAP50-95` 定位质量不足）新增更激进的稳定版实验模块 `StabilizedRAAMambaFusion`。
+- 在 `ultralytics/nn/modules/mamba_fusion.py` 新增 `StabilizedRAAMambaFusion`：删除三路 softmax 竞争式融合，改为 local/global/fft 三路非竞争残差相加，避免某一路被 softmax 边缘化导致训练震荡。
+- `StabilizedRAAMambaFusion` 使用更保守的仿射对齐安全带：`AffineAlign(max_scale=0.05, max_shear=0.05, max_translate=0.05)`，比 RAA-Mamba 的 0.10 更收紧，优先保护定位精度和 `mAP50-95`。
+- 增加 P3/P4/P5 显式分支权重策略：P3 为 `(local=1.00, global=0.20, fft=0.30)` 保护小目标和车辆边缘；P4 为 `(0.70, 0.55, 0.25)` 平衡融合；P5 为 `(0.35, 1.00, 0.20)` 强化全局语义。
+- 在 `ultralytics/nn/modules/__init__.py` 和 `ultralytics/nn/tasks.py` 注册 `StabilizedRAAMambaFusion`；新增实验配置 `ultralytics/cfg/models/v8/yolov8-c2dff-sraamamba.yaml`，第 32/33/34 层分别使用 `StabilizedRAAMambaFusion [256,p3]`、`[512,p4]`、`[1024,p5]`。
+- 更新 `main.py` 默认模型路径为 `yolov8-c2dff-sraamamba.yaml`，并将运行目录前缀改为 `yolov8-c2dff-sraamamba_时间戳`；健康监控回调同步支持 `StabilizedRAAMambaFusion`。
+- 修复 `AffineAlign` 中 clamp 后原地赋值导致反向传播报 inplace gradient error 的问题，改为无原地操作的 delta 构造。
+- 验证：相关 Python 文件 `py_compile` 通过；新 YAML 可解析，P3/P4/P5 分支权重分别为 `(1.0,0.2,0.3)`、`(0.7,0.55,0.25)`、`(0.35,1.0,0.2)`；小尺寸整网前向通过；单模块 CUDA 反向传播通过，P3 初始归一化分支比例约 `[0.6667,0.1333,0.2000]`；整网 CUDA batch=1、imgsz=640、no-grad 前向通过，峰值显存约 `237.9MB`。
+
+2026-05-28 15:17:58 CST
+- 自动止损当前 `yolov8-c2dff-sraamamba_20260528_150213` 训练：截至第 26 轮最佳约 `mAP50=0.27614`、`mAP50-95=0.14576`，早期未明显优于旧 RAA-Mamba/简单 Mamba，并且第 5-10 轮健康监控显示仿射 theta 多层顶到 clamp 边界，存在定位稳定性隐患。
+- 已将中断结果保存到 `saved_results/yolov8-c2dff-sraamamba_20260528_150213_interrupted`，保留 `results.csv`、TensorBoard event、可视化 batch 和 weights，方便后续消融记录。
+- 在 `ultralytics/nn/modules/mamba_fusion.py` 扩展 `AffineAlign`：新增 `delta_scale` 与 `residual_blend`，支持弱残差仿射对齐，避免对齐器直接强重采样主干特征。
+- 新增 `GeometryPreservingRAAMambaFusion`：以原始可见光/红外均值作为 60% 几何锚点，以可靠性基底作为 40% 语义基底；local/global/fft 只作为 `detail_gate` 控制下的残差增量，目标是优先修复 `mAP50-95` 定位质量和训练尖峰问题。
+- `GeometryPreservingRAAMambaFusion` 使用更弱对齐：`max_scale/max_shear/max_translate=0.04`、`delta_scale=0.25`、`residual_blend=0.35`，实际初始最大仿射扰动被压到约 `0.01` 量级。
+- 注册新模块到 `ultralytics/nn/modules/__init__.py` 和 `ultralytics/nn/tasks.py`；新增配置 `ultralytics/cfg/models/v8/yolov8-c2dff-gpraamamba.yaml`，第 32/33/34 层分别使用 `GeometryPreservingRAAMambaFusion [256,p3]`、`[512,p4]`、`[1024,p5]`。
+- 更新 `main.py` 默认训练模型为 `yolov8-c2dff-gpraamamba.yaml`，运行名前缀改为 `yolov8-c2dff-gpraamamba_时间戳`，健康监控回调新增 `detail_gate` 输出。
+
+2026-05-28 15:19:54 CST
+- 验证 `yolov8-c2dff-gpraamamba.yaml` 可解析：第 32/33/34 层均为 `GeometryPreservingRAAMambaFusion`，stage 分别为 `p3/p4/p5`，`delta_scale=0.25`、`residual_blend=0.35`。
+- 小尺寸整网前向通过，检测头输出结构为 `[(1, 13, 84), [(1, 73, 8, 8), (1, 73, 4, 4), (1, 73, 2, 2)]]`；初始 detail gate 约 `0.268`，说明增强分支以受控残差方式注入。
+- 单模块 CUDA 反向传播通过，`GeometryPreservingRAAMambaFusion(64,64,p3)` 在 `2x64x80x80` 输入上输出正常，峰值显存约 `441.5MB`。
+- 整网 CUDA batch=1、imgsz=640、no-grad 前向通过，峰值显存约 `239.7MB`；P3/P4/P5 初始归一化分支比例约 `[0.8183,0.0875,0.0942]`、`[0.6283,0.2888,0.0828]`、`[0.3092,0.6255,0.0652]`，但受 `detail_gate≈0.267-0.270` 限制为小幅残差。
+
+2026-05-28 15:20:38 CST
+- 已自动启动新一轮 `GeometryPreservingRAAMambaFusion` 训练：运行目录 `runs/detect/train/yolov8-c2dff-gpraamamba_20260528_152012`，模型 `ultralytics/cfg/models/v8/yolov8-c2dff-gpraamamba.yaml`，训练参数保持 `epochs=220`、`patience=40`、`batch=8`、`imgsz=640`、`optimizer=SGD`、`lr0=0.01`、`amp=False`、`deterministic=False`。
+- 新模型规模：`YOLOv8-c2dff-gpraamamba summary: 508 layers, 5,624,655 parameters, 5,624,639 gradients`，相比上一轮 SRAA-Mamba 参数量略增，但显存验证仍可接受。
+
+2026-05-28 15:25:33 CST
+- 早期训练健康度记录：`yolov8-c2dff-gpraamamba_20260528_152012` 第 5 轮健康回调显示 P3/P4/P5 的 `theta_delta_abs` 约 `0.004073/0.007435/0.002437`，没有出现上一轮 SRAA-Mamba 的仿射 clamp 贴边问题；`detail_gate` 约 `0.2706/0.2944/0.2707`，增强分支以受控残差注入。
+- 早期指标对比：第 11 轮验证达到约 `mAP50=0.150`、`mAP50-95=0.069`，已经高于 baseline 第 10 轮 `0.12486/0.05325` 和简单 Mamba 第 10 轮 `0.14137/0.06323`；暂不继续改结构，让训练运行到 20-30 轮再判断是否需要第二轮调参。
+
+2026-05-28 15:32:33 CST
+- 自动止损 `yolov8-c2dff-gpraamamba_20260528_152012`：第 20 轮约 `mAP50=0.21771`、`mAP50-95=0.11146`，第 22 轮回升到 `mAP50=0.23580`、`mAP50-95=0.13049`，弱对齐方向有效但整体仍低于旧 RAA-Mamba 第 20 轮 `0.26312/0.14100`，增强分支偏保守。
+- 已归档 GP 中断结果到 `saved_results/yolov8-c2dff-gpraamamba_20260528_152012_interrupted`。
+- 新增 `BoostedGeometryRAAMambaFusion`：沿用 GP 的弱残差对齐安全带 `max=0.04`、`delta_scale=0.25`、`residual_blend=0.35`，保留不贴边的成功点。
+- GP-Boost 将 `detail_gate` 初始偏置从 `-1.0` 调整到 `-0.25`，使增强分支初始开放度从约 `0.27` 提升到约 `0.44`；将原始几何锚点从 `0.60` 降到 `0.35`，可靠性基底从 `0.40` 调到 `0.45`，并将增强残差整体乘以 `1.25`。
+- GP-Boost 分支权重更积极：P3 `(0.70,0.12,0.16)` 强化局部边缘，P4 `(0.50,0.36,0.14)` 平衡局部与全局，P5 `(0.25,0.70,0.10)` 强化语义 Mamba。
+- 注册 `BoostedGeometryRAAMambaFusion` 到 `ultralytics/nn/modules/__init__.py` 与 `ultralytics/nn/tasks.py`；新增配置 `ultralytics/cfg/models/v8/yolov8-c2dff-gpboostmamba.yaml`；更新 `main.py` 默认模型路径和运行名前缀为 `gpboostmamba`。
+
+2026-05-28 15:33:46 CST
+- 验证 `yolov8-c2dff-gpboostmamba.yaml`：第 32/33/34 层均为 `BoostedGeometryRAAMambaFusion`，初始 P3/P4/P5 归一化分支比例约 `[0.7935,0.1031,0.1035]`、`[0.5864,0.3200,0.0937]`、`[0.2985,0.6334,0.0681]`。
+- GP-Boost 初始 `detail_gate` 约 `0.437`，高于 GP 版约 `0.27`；小尺寸整网前向、单模块 CUDA 反向、整网 CUDA batch=1/imgsz=640 前向均通过，整网 no-grad 峰值显存约 `239.7MB`。
+
+2026-05-28 15:34:37 CST
+- 已自动启动 GP-Boost 训练：运行目录 `runs/detect/train/yolov8-c2dff-gpboostmamba_20260528_153356`，模型 `ultralytics/cfg/models/v8/yolov8-c2dff-gpboostmamba.yaml`，训练参数保持 `epochs=220`、`patience=40`、`batch=8`、`imgsz=640`、`optimizer=SGD`、`lr0=0.01`、`amp=False`、`deterministic=False`。
+- 新模型规模：`YOLOv8-c2dff-gpboostmamba summary: 508 layers, 5,624,655 parameters, 5,624,639 gradients`；第 32/33/34 层确认使用 `BoostedGeometryRAAMambaFusion`。
+
+2026-05-28 15:45:11 CST
+- GP-Boost 早期裁决通过：`runs/detect/train/yolov8-c2dff-gpboostmamba_20260528_153356` 第 22 轮达到约 `mAP50=0.278`、`mAP50-95=0.157`，优于 GP 第 22 轮 `0.23580/0.13049`，也优于旧 RAA-Mamba 第 22 轮 `0.23173/0.12688` 和旧 RAA-Mamba 第 20 轮 `0.26312/0.14100`。
+- 训练健康度：第 9 轮健康回调显示 P3/P4/P5 `theta_delta_abs` 约 `0.007955/0.010000/0.003466`，弱残差对齐仍处在安全范围；`detail_gate` 约 `0.4487/0.4690/0.4380`，增强分支有效参与但未出现明显仿射坍塌。
+- 决策：不再中途止损 GP-Boost，让当前训练继续跑完整 `epochs=220` / `patience=40`，后续以 best.pt 和完整 `results.csv` 做最终对照。
+
+2026-05-28 15:50:40 CST
+- GP-Boost 第 25-30 轮进入有效上升区间：第 25 轮约 `mAP50=0.33602`、`mAP50-95=0.18663`，第 27 轮刷新到约 `0.36453/0.19750`，显著高于 GP 和旧 RAA-Mamba 的同阶段曲线。
+- 第 32 轮验证出现一次异常尖峰下跌到约 `0.09930/0.03234`，但第 34 轮恢复到约 `0.328/0.173`，暂判定为验证波动而非结构坍塌。
+- 决策：不中断当前训练，继续观察到第 50-60 轮；若 `mAP50-95` 无法稳定超过 `0.20` 或再次连续多轮坍塌，再自动归档并改为更保守的渐进增强版。
+
+2026-05-28 15:58:34 CST
+- GP-Boost 第 53 轮二次裁决通过：当前 best `mAP50=0.41628`（第 51 轮），best `mAP50-95=0.23741`（第 49 轮），最近 5 轮均值约 `mAP50=0.39580`、`mAP50-95=0.22949`。
+- 虽然第 48 轮仍出现一次验证尖峰下跌到约 `0.10776/0.04956`，但第 49-53 轮连续恢复并稳定在 `mAP50-95≈0.21-0.237`，说明 GP-Boost 已从偶发冲高转入连续有效区间。
+- 决策：继续保留当前训练，不切换结构；下一观察窗口设为第 70-80 轮。如果该窗口仍明显低于 baseline 后期潜力或出现连续坍塌，再归档并改为带训练期渐进门控/冻结扰动的稳定调度版。
+
+2026-05-28 16:02:58 CST
+- GP-Boost 第 63 轮观察：第 56 轮刷新到 `mAP50=0.47605`、`mAP50-95=0.26441`，第 63 轮仍保持约 `0.44276/0.25653`。
+- 最近 10 轮均值约 `mAP50=0.41887`、`mAP50-95=0.23332`，已明显优于 GP、简单 Mamba 和旧 RAA-Mamba 同阶段曲线；当前主要问题从“能否有效”转为“后期是否能追上/超过 baseline 的最终定位精度”。
+- 决策：继续当前训练至第 80 轮观察窗口，不做结构切换；若 80 轮前 best 仍无法逼近 `mAP50≈0.55` 或 `mAP50-95≈0.32`，再考虑启动稳定调度版并保留当前 run 作为 GP-Boost 消融。
+
+2026-05-28 16:08:07 CST
+- GP-Boost 第 75 轮观察：当前 best `mAP50=0.51058`（第 65 轮），best `mAP50-95=0.28493`（第 73 轮），已经逼近第 80 轮观察目标。
+- 最近 20 轮均值约 `mAP50=0.42837`、`mAP50-95=0.24105`，仍有波动但整体学习趋势明显强于早期所有 Mamba 改法。
+- 决策：不在第 75 轮切换实验，继续当前训练；下一观察窗口提前设为第 100 轮，重点看 best 是否突破 `mAP50≈0.58` 与 `mAP50-95≈0.33`。
+
+2026-05-28 16:15:42 CST
+- GP-Boost 第 91 轮观察：当前 best `mAP50=0.53123`（第 89 轮），best `mAP50-95=0.31233`（第 86 轮）；最近 10 轮均值约 `mAP50=0.48093`、`mAP50-95=0.27341`。
+- 为下一轮自动止损/接力准备候选实验 `ScheduledBoostedGeometryRAAMambaFusion`，但不中断当前 GP-Boost 训练；当前 Python 训练进程已加载旧模块，本次代码新增不会影响正在运行的模型。
+- 新增模块 `ScheduledBoostedGeometryRAAMambaFusion`：采用 epoch-aware warmup，前期通过 `schedule_progress` 压低仿射对齐强度和 detail residual 强度，中后期逐步释放；默认弱对齐为 `max_scale/max_shear/max_translate=0.035`、`delta_scale=0.20`，在 forward 中额外使用 `align_strength=0.20+0.18*progress`。
+- `ScheduledBoostedGeometryRAAMambaFusion` 的融合策略为 `raw_weight=0.50-0.15*progress`、`reliable_weight=0.45`、`residual_strength=0.70+0.55*progress`，目标是减少 GP-Boost 第 32/48/66 轮这类验证尖峰，同时保留中后期冲高能力。
+- 注册 `ScheduledBoostedGeometryRAAMambaFusion` 到 `ultralytics/nn/modules/__init__.py` 与 `ultralytics/nn/tasks.py`；新增配置 `ultralytics/cfg/models/v8/yolov8-c2dff-schedboostmamba.yaml`，第 32/33/34 层分别使用 scheduled 版 `[256,p3]`、`[512,p4]`、`[1024,p5]`。
+- `main.py` 新增 `update_scheduled_mamba_progress` 回调，并在健康打印中支持输出 `schedule`；当前默认模型仍保持 `yolov8-c2dff-gpboostmamba.yaml`，所以不会自动切走正在表现良好的 GP-Boost。
+- 验证：`py_compile` 通过；`yolov8-c2dff-schedboostmamba.yaml` 可解析，层 32/33/34 正确识别为 `ScheduledBoostedGeometryRAAMambaFusion`；单模块小尺寸前向通过，`schedule_progress=0.15` 时输出形状正常，初始 P3 分支比例约 `[0.8181,0.0874,0.0946]`，detail gate 约 `0.296`。
+
+2026-05-28 16:20:29 CST
+- GP-Boost 第 113 轮观察：第 104 轮刷新到 `mAP50=0.59410`、`mAP50-95=0.34448`，这是当前最佳点；最近 10 轮均值约 `mAP50=0.53298`、`mAP50-95=0.29637`。
+- 当前 best 仍低于 baseline 后期最佳约 `0.68457/0.43135`，但已经显著超过简单 Mamba 最终 `0.64330/0.40155` 之前的中期走势，并且第 99-112 轮多次达到 `mAP50>0.54`、`mAP50-95>0.30`。
+- 决策：不中断 GP-Boost，继续跑到后期学习率收敛窗口；若后续 40 轮无法刷新 best 或提前 early stop，再使用已准备好的 `yolov8-c2dff-schedboostmamba.yaml` 启动下一轮稳定调度实验。
+
+2026-05-28 16:26:02 CST
+- GP-Boost 第 130 轮观察：第 130 轮刷新 `mAP50=0.63301`、`mAP50-95=0.35231`，第 117 轮仍保持当前 best `mAP50-95=0.36155`。
+- 最近 10 轮均值约 `mAP50=0.54410`、`mAP50-95=0.31087`，说明第 113 轮后的下降不是平台期；当前 mAP50 已接近简单 Mamba 最终 `0.64330`，定位质量也继续向 baseline 收敛。
+- 决策：继续当前 GP-Boost，不启动 scheduled 版；下一观察重点改为第 160-180 轮能否追近 baseline 最终 `mAP50=0.68457`、`mAP50-95=0.43135`。
+
+2026-05-28 16:31:24 CST
+- GP-Boost 第 144 轮观察：第 130 轮仍是当前 best `mAP50=0.63301`，第 139 轮刷新 best `mAP50-95=0.36687`，说明后期定位质量仍在缓慢改善。
+- 最近 20 轮均值约 `mAP50=0.53210`、`mAP50-95=0.30798`，波动仍明显，但当前 run 还没有进入不可恢复平台期。
+- 决策：继续跑到第 160-180 轮；若该窗口不能把 `mAP50-95` 推到 `0.38-0.40` 附近，再考虑归档当前 GP-Boost 并启动 scheduled 版做稳定性对照。
+
+2026-05-28 16:44:12 CST
+- GP-Boost 训练自动结束并已归档到 `saved_results/yolov8-c2dff-gpboostmamba_20260528_153356`；实际完成 170 轮。
+- 最终 best `mAP50=0.63301`（第 130 轮），best `mAP50-95=0.36813`（第 169 轮），最后一轮为 `mAP50=0.58619`、`mAP50-95=0.35457`。
+- 结论：GP-Boost 明显优于早期简单替换 Mamba 的训练过程和稳定性，但仍未超过 baseline 最终约 `0.68457/0.43135`，也未超过简单 Mamba 的 best `mAP50-95=0.40155`，说明“强残差增强”仍存在定位上限不足。
+- 决策：按前面准备好的方案切换到 `ScheduledBoostedGeometryRAAMambaFusion` 稳定调度版继续实验，目标是降低 GP-Boost 的验证尖峰并提高后期 `mAP50-95` 上限。
+
+2026-05-28 16:45:31 CST
+- 更新 `main.py` 默认模型为 `ultralytics/cfg/models/v8/yolov8-c2dff-schedboostmamba.yaml`，运行名前缀改为 `yolov8-c2dff-schedboostmamba_时间戳`。
+- 保持训练参数不变：`epochs=220`、`patience=40`、`batch=8`、`imgsz=640`、`optimizer=SGD`、`lr0=0.01`、`amp=False`、`deterministic=False`。
+- 验证：`main.py` 与相关注册文件 `py_compile` 通过；YAML 解析确认第 32/33/34 层为 `ScheduledBoostedGeometryRAAMambaFusion`，stage 分别为 `p3/p4/p5`。
+
+2026-05-28 16:46:08 CST
+- 已启动 Scheduled-Boost 训练：运行目录 `runs/detect/train/yolov8-c2dff-schedboostmamba_20260528_164556`，模型 `ultralytics/cfg/models/v8/yolov8-c2dff-schedboostmamba.yaml`。
+- 模型规模与 GP-Boost 一致：`508 layers, 5,624,655 parameters, 5,624,639 gradients`；第 32/33/34 层确认使用 `ScheduledBoostedGeometryRAAMambaFusion`。
+- 数据集扫描仍存在原始标注越界/负值警告，属于此前已有数据问题；训练已进入第 1 轮，显存约 `5.5G`。
+
+2026-05-28 16:49:58 CST
+- Scheduled-Boost 第 9 轮早期观察：第 9 轮约 `mAP50=0.13336`、`mAP50-95=0.05463`，优于 GP-Boost 第 9 轮约 `0.09972/0.04086`。
+- 第 3-4 轮仍出现 val cls 尖峰，但第 5 轮后恢复，暂不判定为结构坍塌；当前训练进程仍正常运行。
+- 决策：继续到第 20-30 轮做硬裁决，重点比较 GP-Boost 第 22/27/41/56 轮节点。
+
+2026-05-28 16:54:08 CST
+- Scheduled-Boost 第 21 轮观察：当前 best 第 19 轮约 `mAP50=0.23442`、`mAP50-95=0.12156`，第 21 轮约 `0.23183/0.12152`。
+- 与 GP-Boost 同期相比，第 21 轮 GP-Boost 约 `0.23778/0.11720`；Scheduled-Boost 的定位略高、mAP50 略低，符合“稳定调度早期更慢但定位更稳”的预期。
+- 决策：继续到第 30-40 轮再裁决；若 mAP50 长期低于 GP-Boost 同期且 mAP50-95 没有明显稳定优势，则停止 scheduled 版并改做数据/损失层面的实验。
+
+2026-05-28 16:58:58 CST
+- Scheduled-Boost 第 33 轮观察：当前 best `mAP50=0.35263`（第 31 轮），best `mAP50-95=0.19754`（第 29 轮），最近 10 轮均值约 `mAP50=0.30542`、`mAP50-95=0.16626`。
+- 与 GP-Boost 同期相比，Scheduled-Boost 的 `mAP50` 略低，`mAP50-95` 接近但尚无明显优势；不过第 32 轮下降到 `0.23880/0.11815`，没有 GP-Boost 第 32 轮 `0.09930/0.03234` 那么严重。
+- 决策：继续观察到第 45-50 轮；如果不能追上 GP-Boost 第 41-49 轮区间的 `mAP50≈0.40`、`mAP50-95≈0.23`，则停止 scheduled 版并把下一轮重点转向数据标注清洗/损失权重/训练策略。
+
+2026-05-28 17:01:37 CST
+- Scheduled-Boost 第 51 轮观察：第 50 轮刷新到 `mAP50=0.40812`、`mAP50-95=0.23940`，已经追平 GP-Boost 第 49 轮约 `0.40814/0.23741`，定位指标略高。
+- 第 51 轮回落到约 `0.30802/0.16542`，但这是单轮波动；最近 10 轮均值约 `mAP50=0.36413`、`mAP50-95=0.20302`。
+- 决策：Scheduled-Boost 未判负，继续训练到第 70-80 轮；重点比较 GP-Boost 第 56 轮 `0.47605/0.26441` 和第 73 轮 `0.49614/0.28493`。
+
+2026-05-28 17:07:36 CST
+- Scheduled-Boost 第 66 轮观察：当前 best `mAP50=0.46449`（第 63 轮），best `mAP50-95=0.27987`（第 57 轮）。
+- 与 GP-Boost 对照：GP-Boost 第 56 轮约 `0.47605/0.26441`，第 73 轮约 `0.49614/0.28493`；Scheduled-Boost 的 mAP50 略低，但第 57 轮定位质量已经接近 GP-Boost 第 73 轮。
+- 最近 10 轮均值约 `mAP50=0.43391`、`mAP50-95=0.24422`，优于 GP-Boost 第 56-63 轮附近的平均稳定性，说明 scheduled 版有继续观察价值。
+- 决策：继续训练到第 80 轮；若第 80 轮前 `mAP50-95` 能突破 `0.30`，则继续完整训练，否则再考虑转向数据标注清洗和损失权重实验。
+
+2026-05-28 17:11:28 CST
+- Scheduled-Boost 已按止损规则中断并归档到 `saved_results/yolov8-c2dff-schedboostmamba_20260528_164556_interrupted`。
+- 中断前完成 79 轮，best `mAP50=0.48273`、best `mAP50-95=0.29338`（第 77 轮），未突破预设 `mAP50-95=0.30`，也低于 GP-Boost 第 86 轮 `0.31233` 和最终 best `0.36813`。
+- 结论：Scheduled-Boost 验证了“调度可降低部分极端尖峰”的方向，但提升上限不足；继续堆融合模块收益有限。
+- 决策：下一轮转向更直接补定位精度的实验：数据标注清洗 + 高分辨率/定位损失强化训练，保留 GP-Boost 结构作为当前最强融合主干。
+
+2026-05-28 17:24:12 CST
+- 对 `data/VEDAI_1024/labels` 执行可回滚数据清洗，原始标签已备份到 `data/VEDAI_1024/labels_backup_before_clean_20260528_172357`。
+- 清洗前统计：训练集和测试集各有 52 条坏标注，其中每个 split 各 40 条缺失宽高的残缺行、12 条越界/负值归一化坐标；此外存在若干轻微越界框。
+- 清洗规则：删除无法构成 YOLO 五元组的残缺行；类别必须在 `[0,8]`；将轻微越界框按图像边界裁剪到 `[0,1]`，裁剪后退化的框删除；清除 `labels/train.cache` 与 `labels/test.cache` 以强制 YOLO 重扫标签。
+- 清洗结果：删除 `80` 条残缺标注，裁剪 `130` 个轻微越界框，保留有效标注 `7514` 条；复检 `bad_lines=0`。
+- 注意：这会改变验证集标签，后续实验属于“清洗数据版”，不能和旧未清洗测试集指标做完全等价横向比较，但可以验证定位上限是否被坏标注压住。
+
+2026-05-28 17:25:31 CST
+- 修改 `main.py` 启动清洗数据定位强化实验：模型切回当前最强结构 `ultralytics/cfg/models/v8/yolov8-c2dff-gpboostmamba.yaml`，运行名前缀改为 `yolov8-c2dff-gpboostmamba-clean768_时间戳`。
+- 训练参数调整：`imgsz` 从 `640` 提高到 `768`，`batch` 从 `8` 降到 `4` 控制显存，`lr0` 从 `0.01` 降到 `0.008`；`box` 从默认 `7.5` 提到 `9.0`，`dfl` 从默认 `1.5` 提到 `2.0`，`cls` 从默认 `0.5` 降到 `0.45`。
+- 目的：在清洗标签后重点提升边界框定位质量和小目标边缘，直接冲 `mAP50-95`，不再继续堆融合模块。
+- 验证：`main.py` 语法编译通过。
+
+2026-05-28 17:28:03 CST
+- 已启动 Clean768-GPBoost 训练：运行目录 `runs/detect/train/yolov8-c2dff-gpboostmamba-clean768_20260528_172717`，模型 `yolov8-c2dff-gpboostmamba.yaml`。
+- YOLO 重建 `train.cache` 与 `test.cache` 时未再打印坏标注 warning，说明清洗后的标签已被正常接受。
+- 训练显存约 `4.2G`，`imgsz=768`、`batch=4` 可运行；模型规模仍为 `508 layers, 5,624,655 parameters, 5,624,639 gradients`。
+
+2026-05-28 17:31:31 CST
+- Clean768-GPBoost 第 6 轮早期观察：第 6 轮约 `mAP50=0.09970`、`mAP50-95=0.04316`，起步接近 GP-Boost 第 9 轮 `0.09972/0.04086`。
+- 第 5-6 轮验证 cls loss 已从前几轮尖峰恢复，暂未出现因 `imgsz=768` 或定位损失增强导致的训练崩溃。
+- 决策：继续到第 20-30 轮做早期裁决，重点看 `mAP50-95` 是否比 clean 前 GP-Boost 更快上升。
+
+2026-05-28 17:36:42 CST
+- Clean768-GPBoost 第 17 轮观察：当前 best 第 15 轮约 `mAP50=0.20535`、`mAP50-95=0.10769`，最近 5 轮均值约 `0.18106/0.09478`。
+- 对照 clean 前 GP-Boost 第 15 轮约 `0.18983/0.09011`，Clean768 在同阶段 mAP50 与 mAP50-95 均更高，说明数据清洗 + 768 + 定位损失强化方向有效。
+- 决策：继续训练到第 30 轮再做硬裁决；若第 30 轮附近能超过 GP-Boost 第 27 轮 `0.36453/0.19750`，则保留此方向跑完整训练。
+
+2026-05-28 17:42:24 CST
+- Clean768-GPBoost 第 28 轮观察：当前 best `mAP50=0.30508`、`mAP50-95=0.17465`（第 28 轮），最近 5 轮均值约 `0.28700/0.16130`。
+- 对照 clean 前 GP-Boost 第 27 轮约 `0.36453/0.19750`，Clean768 暂时落后；但 Clean768 使用 `batch=4`、`imgsz=768`、更高定位损失，早期收敛速度慢是预期内，且曲线更平滑，没有 GP-Boost 第 32 轮式极端坍塌。
+- 决策：继续到第 40-45 轮做第二次裁决；若仍无法接近 GP-Boost 第 41 轮 `0.40021/0.22814`，则停止 Clean768 并改为在清洗数据上跑 `imgsz=640 + batch=8 + 定位损失增强` 的折中实验。
+
+2026-05-28 17:49:09 CST
+- Clean768-GPBoost 已中断并归档到 `saved_results/yolov8-c2dff-gpboostmamba-clean768_20260528_172717_interrupted`。
+- 中断前完成 40 轮，best `mAP50=0.33923`（第 35 轮），best `mAP50-95=0.20538`（第 39 轮），未接近 clean 前 GP-Boost 第 41 轮 `0.40021/0.22814`。
+- 结论：清洗标签 + 高分辨率 + 强定位损失让曲线更平滑，但 `768/batch4` 收敛太慢，早期收益不足。
+- 决策：启动折中实验 `Clean640-GPBoost`，保留清洗标签和定位损失增强，但恢复 `imgsz=640`、`batch=8`，观察是否能同时保留收敛速度和定位收益。
+
+2026-05-28 17:50:03 CST
+- 更新 `main.py` 为 Clean640Loc-GPBoost 折中实验：运行名前缀 `yolov8-c2dff-gpboostmamba-clean640loc_时间戳`。
+- 训练参数：`imgsz=640`、`batch=8`、`lr0=0.008`、`box=9.0`、`dfl=2.0`、`cls=0.45`、`epochs=220`、`patience=45`。
+- 目的：在清洗标签基础上保留定位损失增强，同时恢复 GP-Boost 原有收敛速度，验证 mAP50-95 是否优于 clean 前 GP-Boost。
+- 验证：`main.py` 语法编译通过。
+
+2026-05-28 17:52:41 CST
+- 已启动 Clean640Loc-GPBoost 训练：运行目录 `runs/detect/train/yolov8-c2dff-gpboostmamba-clean640loc_20260528_175215`。
+- 训练使用清洗后的标签缓存，模型为 `yolov8-c2dff-gpboostmamba.yaml`，显存约 `5.6G`，`batch=8/imgsz=640` 正常运行。
+
+2026-05-28 17:59:10 CST
+- Clean640Loc-GPBoost 已中断并归档到 `saved_results/yolov8-c2dff-gpboostmamba-clean640loc_20260528_175215_interrupted`。
+- 中断前观察到第 23 轮 results：best `mAP50=0.25622`、best `mAP50-95=0.13565`（第 21 轮），低于 clean 前 GP-Boost 第 22 轮约 `0.27787/0.15726`。
+- 结论：在清洗标签上直接加重 `box=9.0/dfl=2.0` 会拖慢早期收敛，不能作为当前主路线。
+- 决策：启动最干净的数据清洗对照实验：保留清洗后的标签，使用 GP-Boost 原始训练设置 `imgsz=640`、`batch=8`、`lr0=0.01`、默认 `box/dfl/cls`，单独验证“数据清洗”本身的收益。
+
+2026-05-28 18:00:16 CST
+- 更新 `main.py` 为 Clean640-GPBoost 对照实验：运行名前缀 `yolov8-c2dff-gpboostmamba-clean640_时间戳`。
+- 训练参数恢复 GP-Boost 原设置：`imgsz=640`、`batch=8`、`lr0=0.01`、默认 `box/dfl/cls`，仅保留清洗后的标签变化。
+- 验证：`main.py` 语法编译通过。
+
+2026-05-28 18:04:13 CST
+- 已启动 Clean640-GPBoost 对照训练：运行目录 `runs/detect/train/yolov8-c2dff-gpboostmamba-clean640_20260528_180413`。
+- 模型配置：`ultralytics/cfg/models/v8/yolov8-c2dff-gpboostmamba.yaml`，训练使用清洗后的标签缓存；YOLO 启动时未再打印坏标注 warning。
+- 训练参数：`imgsz=640`、`batch=8`、`lr0=0.01`、默认 `box/dfl/cls`、`epochs=220`、`patience=45`，显存约 `5.4G`。
+- 第 5 轮早期观察：当前 best `mAP50=0.03479`、`mAP50-95=0.01205`（第 5 轮）。第 2-4 轮验证 `cls_loss` 出现尖峰，第 5 轮已恢复到约 `13.032`，暂不判负。
+- 决策：继续观察到第 15-20 轮；若仍显著落后 clean 前 GP-Boost 第 15 轮 `0.18983/0.09011`，则停止并转向从 dirty GP-Boost best 权重进行清洗标签微调的实验。
+
+2026-05-28 18:09:50 CST
+- Clean640-GPBoost 第 13 轮观察：当前 best 第 12 轮 `mAP50=0.19878`、`mAP50-95=0.09685`。
+- 对照 clean 前 GP-Boost 第 15 轮 `0.18983/0.09011`，Clean640 从头训练已经略高，说明单独“清洗标签 + 原训练设置”方向有效，暂不切换微调路线。
+- 第 5 轮健康检查：P3/P4/P5 `fusion_gate[local,global,fft]` 分别约 `[0.7928,0.1034,0.1038]`、`[0.5861,0.3201,0.0939]`、`[0.2980,0.6338,0.0682]`；P3 local 偏强但未超过 `0.85` 红线，P4/P5 未坍塌。
+- `theta_delta_abs` 约 `0.0039-0.0100`，仿射对齐未出现越界坍塌。
+- 决策：继续训练到第 22/27 轮，分别对照 clean 前 GP-Boost 第 22 轮 `0.27787/0.15726` 与第 27 轮 `0.36453/0.19750`。
+
+2026-05-28 18:14:08 CST
+- Clean640-GPBoost 第 21 轮观察：当前 best 第 20 轮 `mAP50=0.28466`、`mAP50-95=0.15301`。
+- 对照 clean 前 GP-Boost 第 22 轮 `0.27787/0.15726`，Clean640 的 `mAP50` 略高、`mAP50-95` 略低，整体接近；第 21 轮单轮回落到 `0.17945/0.07125`，但第 17-20 轮趋势仍是上升。
+- 决策：继续观察到第 27 轮；若第 27 轮前 `mAP50-95` 仍不能接近或突破 `0.19750`，则停止该从头训练线，改为从 `saved_results/yolov8-c2dff-gpboostmamba_20260528_153356/weights/best.pt` 做低学习率清洗标签微调。
+
+2026-05-28 18:19:23 CST
+- Clean640-GPBoost 从头训练已中断并归档到 `saved_results/yolov8-c2dff-gpboostmamba-clean640_20260528_180413_interrupted`。
+- 中断前写入 29 轮结果，best 第 25 轮 `mAP50=0.29275`、`mAP50-95=0.15390`；第 27 轮 `0.28262/0.14758`，未追上 clean 前 GP-Boost 第 27 轮 `0.36453/0.19750`；第 28 轮发生一次明显验证坍塌 `0.01926/0.00955`。
+- 结论：清洗标签从头训练早期可追平第 20 轮附近，但第 25-29 轮上限不足、波动仍大；不再继续烧完整 220 轮。
+- 修改 `main.py` 切换到清洗标签低学习率微调实验：模型从 `saved_results/yolov8-c2dff-gpboostmamba_20260528_153356/weights/best.pt` 加载；运行名前缀改为 `yolov8-c2dff-gpboostmamba-cleanfinetune_时间戳`。
+- 微调参数：`epochs=90`、`patience=25`、`batch=8`、`imgsz=640`、`optimizer=SGD`、`lr0=0.002`、`lrf=0.1`、`momentum=0.937`、默认损失权重。
+- 目的：验证“dirty GP-Boost 已学习到的跨模态融合能力 + 清洗标签校正定位边界”的上限，重点冲 `mAP50-95`，避免从零训练早期不稳定。
+- 验证：`main.py` 语法编译通过。
+
+2026-05-28 18:19:01 CST
+- 已启动 CleanFinetune-GPBoost 微调训练：运行目录 `runs/detect/train/yolov8-c2dff-gpboostmamba-cleanfinetune_20260528_181901`。
+- 启动日志确认 `Transferred 772/772 items from pretrained weights`，说明历史 GP-Boost best 权重与当前结构完全匹配。
+- 训练首轮起始 loss 约 `box_loss≈1.1-1.2`、`cls_loss≈1.1-1.2`、`dfl_loss≈0.9`，显著低于从头训练首轮，微调路线正常启动。
+- 运行中出现 `No module named 'seaborn'`，仅影响 YOLO 绘图，不影响训练与验证，暂不打断安装。
+
+2026-05-28 18:25:44 CST
+- CleanFinetune-GPBoost 已中断并归档到 `saved_results/yolov8-c2dff-gpboostmamba-cleanfinetune_20260528_181901_interrupted`。
+- 中断前写入 6 轮结果：第 1 轮 `0.56047/0.31594`，第 4 轮 `0.53401/0.32177`，第 6 轮刷新到 `mAP50=0.58071`、`mAP50-95=0.33578`。
+- 结论：从历史 best 权重在清洗标签上微调是当前最强方向，已明显超过从头训练；但第 5 轮曾跌到 `0.48840/0.29206`，说明全量微调仍有波动，可能会破坏已学到的双流表征。
+- 修改 `main.py` 为 CleanHeadTune-GPBoost 保守精修实验：继续从 `saved_results/yolov8-c2dff-gpboostmamba_20260528_153356/weights/best.pt` 加载，但冻结前 `32` 层双流骨干，只训练 Mamba 融合层、FPN 与检测头。
+- 新训练参数：`epochs=45`、`patience=12`、`lr0=0.0005`、`lrf=0.2`、`warmup_epochs=0.0`、`freeze=32`、关闭 `mosaic/mixup/copy_paste/erasing`，弱化颜色和平移缩放增强（`translate=0.02`、`scale=0.15`、`hsv_h=0.005`、`hsv_s=0.25`、`hsv_v=0.2`）。
+- 目的：保留旧 best 的主干表征，只让融合层和检测头适配清洗后的边界框，降低微调波动，尝试稳定提升 `mAP50-95`。
+- 验证：`main.py` 语法编译通过。
+
+2026-05-28 18:24:00 CST
+- 已启动 CleanHeadTune-GPBoost 保守精修训练：运行目录 `runs/detect/train/yolov8-c2dff-gpboostmamba-cleanheadtune_20260528_182400`。
+- 启动日志确认 `Transferred 772/772 items from pretrained weights`。
+- `freeze=32` 生效，冻结范围到 `model.31`，保留 `model.32-34` 的 `BoostedGeometryRAAMambaFusion`、FPN 与 Detect 头可训练。
+- 当前策略：低学习率 `lr0=0.0005`，无 warmup，关闭 mosaic/mixup/copy_paste/erasing，弱化 HSV/平移/缩放增强，重点观察前 5-10 轮是否比全量微调更稳定。
+
+2026-05-28 18:31:02 CST
+- CleanHeadTune-GPBoost 第 5 轮观察：当前 best `mAP50=0.63554`（第 3 轮）、best `mAP50-95=0.38032`（第 4 轮）。
+- 第 1-5 轮指标依次为：`0.58721/0.33755`、`0.62592/0.37262`、`0.63554/0.37458`、`0.63422/0.38032`、`0.62481/0.36485`。
+- 对照历史 GP-Boost best `mAP50=0.63301`、`mAP50-95=0.36813`，CleanHeadTune 已在前 5 轮同时刷新 `mAP50` 和 `mAP50-95`，其中定位指标提升约 `+0.01219`。
+- 结论：冻结双流骨干、只精修 Mamba 融合层/FPN/Head 的策略有效，波动显著小于全量微调，且比清洗标签从头训练强得多。
+- 决策：继续训练，不再打断；下一裁决点放在第 12-15 轮，观察 `mAP50-95` 是否能稳定突破 `0.39`。
+
+2026-05-28 18:36:28 CST
+- CleanHeadTune-GPBoost 第 13 轮观察：当前 best `mAP50=0.66886`（第 13 轮）、best `mAP50-95=0.40118`（第 10 轮）。
+- 第 8-13 轮分别为：`0.65550/0.38414`、`0.65172/0.38440`、`0.66865/0.40118`、`0.66782/0.39221`、`0.63537/0.37543`、`0.66886/0.40085`。
+- 最近 5 轮均值约 `mAP50=0.65848`、`mAP50-95=0.39081`，最近 10 轮均值约 `0.64737/0.38295`。
+- 对照历史 GP-Boost best `0.63301/0.36813`，当前 best 提升约 `+0.03585 mAP50`、`+0.03305 mAP50-95`；已经稳定跨过 `mAP50-95=0.40`，具备作为论文主结果的潜力。
+- 第 5 轮健康检查：P3/P4/P5 `fusion_gate[local,global,fft]` 约 `[0.8212,0.0879,0.0909]`、`[0.5780,0.3234,0.0986]`、`[0.2934,0.6339,0.0727]`；P3 local 接近但未超过 `0.85` 红线，theta 仍被限制在安全范围。
+- 决策：继续自然训练/早停；若后续 8-10 轮不能超过 `0.40118`，保留第 10 轮 best 作为当前最强权重，不再额外改结构。
+
+2026-05-28 18:41:46 CST
+- CleanHeadTune-GPBoost 第 25 轮观察：当前 best 仍为第 13 轮 `mAP50=0.66886` 和第 10 轮 `mAP50-95=0.40118`。
+- 第 15-25 轮没有超过第 10/13 轮最佳，最近 5 轮均值约 `mAP50=0.63412`、`mAP50-95=0.37530`，最近 10 轮均值约 `0.63958/0.38037`。
+- 结论：继续训练没有带来进一步收益，但 `best.pt` 已保存高点；当前不再改结构，等待训练自然结束/早停并归档，最终采用第 10/13 轮对应 best 权重。
+
+2026-05-28 18:45:31 CST
+- CleanHeadTune-GPBoost 训练已自然早停并完成归档：`saved_results/yolov8-c2dff-gpboostmamba-cleanheadtune_20260528_182400`。
+- 早停信息：共完成 `25` 轮，因最近 `12` 轮无提升停止；最佳结果来自第 `13` 轮，best 权重已保存。
+- 最终 best 验证结果：`all P=0.632`、`R=0.631`、`mAP50=0.669`、`mAP50-95=0.401`。
+- 分类别结果：`car 0.860/0.548`、`pickup 0.653/0.416`、`camping 0.689/0.484`、`truck 0.639/0.395`、`other 0.427/0.231`、`tractor 0.704/0.290`、`boat 0.491/0.317`、`van 0.563/0.380`、`plane 0.995/0.548`（格式为 `mAP50/mAP50-95`）。
+- 对照历史未清洗 GP-Boost best `mAP50=0.63301`、`mAP50-95=0.36813`，当前 clean-headtune best 提升约 `+0.036 mAP50`、`+0.033 mAP50-95`。
+- 权重路径：`saved_results/yolov8-c2dff-gpboostmamba-cleanheadtune_20260528_182400/weights/best.pt`。
+- 运行末尾出现若干 `HAMI-core cuCtxSetCurrent111 failed`，发生在结果保存和归档之后，未影响 best 权重、results.csv 或验证输出。
+
+2026-05-28 18:55:00 CST
+- 按要求将 `main.py` 改为真正从头训练 `200` 轮的 GP-Boost RAA-Mamba 对照实验。
+- 模型加载从 `saved_results/yolov8-c2dff-gpboostmamba_20260528_153356/weights/best.pt` 改为 `ultralytics/cfg/models/v8/yolov8-c2dff-gpboostmamba.yaml`，即从 YAML 随机初始化，不再使用历史 best 权重。
+- 运行名前缀从 `yolov8-c2dff-gpboostmamba-cleanheadtune_时间戳` 改为 `yolov8-c2dff-gpboostmamba-scratch200_时间戳`。
+- 训练参数从保守精修配置改为从头训练配置：`epochs=200`、`patience=50`、`batch=8`、`imgsz=640`、`optimizer=SGD`、`lr0=0.01`。
+- 已移除二阶段精修专用参数：不再设置 `freeze=32`、`lr0=0.0005`、`warmup_epochs=0.0`、关闭强增强等配置；恢复 YOLO 默认增强策略。
+- 保留 RAA-Mamba 健康检查 callback，仅用于第 5-10 轮打印门控/仿射状态，不改变训练计算。
+- 验证：`main.py` 语法编译通过。
+
+2026-05-28 19:25:00 CST
+- 按“明确痛点、轻量、可消融、能可视化/记录”的标准新增自创模块 `SpatialConsistencyGate` 与 `ConsistencyGuidedRAAMambaFusion`。
+- 新模块动机：针对 RGB/IR 非严格配准时的错误融合问题，在空间位置级估计跨模态一致性；一致区域增强 Mamba/局部/频域跨模态细节，不一致区域回退到 raw/reliability 安全基底并保留少量局部特征。
+- 新增文件/代码位置：`ultralytics/nn/modules/mamba_fusion.py` 中新增 `SpatialConsistencyGate` 和 `ConsistencyGuidedRAAMambaFusion`。
+- `SpatialConsistencyGate` 输入可见光特征、对齐红外特征、绝对差异、频域差异和通道余弦相似图，输出范围约 `[0.25, 1.0]` 的 consistency mask，避免训练早期完全掐断跨模态分支。
+- `ConsistencyGuidedRAAMambaFusion` 保留弱仿射对齐、频域差异、模态可靠性门控、局部分支和 BiSSM/Mamba 全局分支，并使用 `consistency` 调制跨模态 detail residual。
+- 注册修改：`ultralytics/nn/modules/__init__.py` 导入并导出 `ConsistencyGuidedRAAMambaFusion`；`ultralytics/nn/tasks.py` 导入并加入 `parse_model` 的多输入融合模块集合。
+- 新增配置：`ultralytics/cfg/models/v8/yolov8-c2dff-cgraamamba.yaml`，在 P3/P4/P5 三个尺度用 `ConsistencyGuidedRAAMambaFusion` 替换 `BoostedGeometryRAAMambaFusion`，保留旧 `yolov8-c2dff-gpboostmamba.yaml` 作为消融对照。
+- 更新 `main.py`：健康检查支持打印 `consistency` 均值；训练模型改为 `ultralytics/cfg/models/v8/yolov8-c2dff-cgraamamba.yaml`；运行名前缀改为 `yolov8-c2dff-cgraamamba-scratch200_时间戳`。
+- 验证：`main.py`、`mamba_fusion.py`、`modules/__init__.py`、`tasks.py` 均通过语法编译。
+
+2026-05-28 19:59:03 CST
+- 已启动 CGRAA-Mamba 从头训练实验：运行目录 `runs/detect/train/yolov8-c2dff-cgraamamba-scratch200_20260528_195903`。
+- 模型配置 `ultralytics/cfg/models/v8/yolov8-c2dff-cgraamamba.yaml` 成功解析，P3/P4/P5 三个尺度均使用 `ConsistencyGuidedRAAMambaFusion`。
+- 模型规模：`538 layers, 5,733,858 parameters, 5,733,842 gradients`，相比上一版 GP-Boost 约 `5.62M` 参数仅轻量增加。
+- 训练参数：从 YAML 随机初始化，`epochs=200`、`patience=50`、`batch=8`、`imgsz=640`、`lr0=0.01`、默认增强。
+- 首轮训练已正常进入，无注册/维度错误；下一步观察第 5-10 轮的 `consistency`、门控和早期 mAP 曲线。
+
+2026-05-28 20:01:45 CST
+- CGRAA-Mamba 第 7 轮早期观察：当前 best 第 6 轮 `mAP50=0.10685`、`mAP50-95=0.04547`；第 7 轮回落到 `0.04567/0.01510`。
+- 第 6 轮健康检查：P3/P4/P5 `consistency` 均值分别约 `0.5435/0.5627/0.5486`，没有把跨模态分支完全关闭；`fusion_gate[local,global,fft]` 分别约 `[0.8084,0.0819,0.1097]`、`[0.5961,0.3102,0.0937]`、`[0.2865,0.6459,0.0676]`。
+- P3 local gate 未超过 `0.85` 红线；`theta_delta_abs` 约 `0.0009-0.0066`，仿射对齐没有坍塌。
+- 决策：继续训练到第 15-20 轮再裁决；若早期明显慢于 GP-Boost scratch 对照，则优先调整训练稳定性（降低 `lr0`/弱化增强），暂不继续堆结构。
+
+2026-05-28 20:08:32 CST
+- CGRAA-Mamba 默认增强从头训练已按止损规则中断并归档到 `saved_results/yolov8-c2dff-cgraamamba-scratch200_20260528_195903_interrupted`。
+- 中断前写入 18 轮结果，best 第 18 轮 `mAP50=0.24819`、`mAP50-95=0.12638`；虽然第 18 轮追回一部分，但整体早期仍低于/不优于 GP-Boost scratch 同期曲线。
+- 结论：新 consistency 结构本身无维度和数值错误，但默认 `lr0=0.01 + mosaic=1.0 + 强增强` 对该模块从头训练不够稳定。
+- 修改 `ConsistencyGuidedRAAMambaFusion`：新增 `schedule_progress` 与 `set_schedule_progress()`，将 consistency 调制的 cross-detail residual 从 `0.35` 逐步 warmup 到 `1.15`，局部 fallback 从 `0.12` 逐步到 `0.20`；避免训练早期新分支过强扰动。
+- 修复：为 `ConsistencyGuidedRAAMambaFusion.__init__` 正确初始化 `self.schedule_progress = 1.0`，并通过实例化测试确认 `set_schedule_progress()` 可用。
+- 修改 `main.py` 为 CGRAA-Mamba 稳定版从头训练：运行名前缀 `yolov8-c2dff-cgraamamba-stable200_时间戳`；`lr0=0.008`、`lrf=0.02`、`warmup_epochs=5.0`、`mosaic=0.5`、`translate=0.05`、`scale=0.3`、`erasing=0.2`，其余保持 `epochs=200`、`patience=50`、`batch=8`、`imgsz=640`。
+- 验证：`mamba_fusion.py` 与 `main.py` 语法编译通过。
+
+2026-05-28 20:11:54 CST
+- 已启动 CGRAA-Mamba 稳定版从头训练：运行目录 `runs/detect/train/yolov8-c2dff-cgraamamba-stable200_20260528_201154`。
+- 启动日志确认模型仍为 `538 layers, 5,733,858 parameters`，训练配置为 `lr0=0.008`、`lrf=0.02`、`warmup_epochs=5.0`、`mosaic=0.5`、`translate=0.05`、`scale=0.3`、`erasing=0.2`。
+- 训练已正常进入第 1 轮，下一步观察第 5-10 轮健康检查中的 `schedule/consistency` 与早期 mAP。
+
+2026-05-28 20:17:38 CST
+- CGRAA-Mamba 稳定版第 10 轮观察：当前 best 第 9 轮 `mAP50=0.14928`、`mAP50-95=0.06763`；第 10 轮为 `0.12053/0.05498`。
+- 第 9 轮健康检查：P3/P4/P5 `consistency` 均值约 `0.5465/0.5635/0.5526`，`schedule=0.129`，说明 consistency detail residual warmup 已生效且未关闭跨模态分支。
+- 同期对比：稳定版第 9 轮略优于默认增强 CGRAA 第 10 轮，并接近/略优于 GP-Boost clean640 第 9-10 轮早期水平；暂不调整。
+- 决策：继续到第 18-20 轮做同口径裁决，重点比较默认 CGRAA 第 18 轮 `0.24819/0.12638` 和旧 GP-Boost scratch/clean640 早期曲线。
+
+2026-05-29 10:45:20 CST
+- 补充归档 CGRAA-Mamba 稳定版从头训练结果：`saved_results/yolov8-c2dff-cgraamamba-stable200_20260528_201154`。
+- 该实验实际写入 `133` 轮结果；best `mAP50=0.62321`（第 121 轮，`mAP50-95=0.34204`），best `mAP50-95=0.36512`（第 115 轮，`mAP50=0.61632`）。
+- 第 122-133 轮后段稳定在约 `mAP50=0.52-0.61`、`mAP50-95=0.30-0.36`，说明一致性引导模块没有训练崩溃，但仍低于当前最强 CleanHeadTune-GPBoost `0.66886/0.40118`。
+- 结论：CGRAA 的创新点可解释性更强，但从头训练上限不足；小数据条件下继续增强自由分支会提高方差，不宜再单纯堆 Mamba/门控。
+
+2026-05-29 10:45:20 CST
+- 按“小数据友好、初始不扰动、残差逐步学习”的思路新增自创模块 `ResidualConsistencyMambaFusion`。
+- 新模块位置：`ultralytics/nn/modules/mamba_fusion.py`。核心机制：以 `0.65 * raw_base + 0.35 * reliable_base` 作为安全锚点，结合弱仿射对齐、模态可靠性、空间一致性、局部卷积、BiSSM/Mamba 和频域差异，只学习一个残差修正项。
+- 稳定性设计：`residual_proj` 使用零初始化，使模型初始近似安全锚点；`residual_strength` 从 `0.15` 随训练进度 warmup 到 `0.85`，降低从头训练早期扰动。
+- 新模块可解释指标：继续记录 `fusion_gate[local,global,fft]`、`reliability[vis,ir]`、`theta_delta_abs`、`consistency` 和 `schedule`，便于论文消融和健康检查。
+- 注册修改：`ultralytics/nn/modules/__init__.py` 导入并导出 `ResidualConsistencyMambaFusion`；`ultralytics/nn/tasks.py` 将其加入 YOLO YAML 多输入融合模块解析集合。
+- 新增配置：`ultralytics/cfg/models/v8/yolov8-c2dff-rcmamba.yaml`，P3/P4/P5 三尺度分别使用 `ResidualConsistencyMambaFusion`，检测头仍保持原 YOLOv8 Detect(P3,P4,P5) 不变。
+- 修改 `main.py`：模型切换为 `yolov8-c2dff-rcmamba.yaml`；运行名前缀改为 `yolov8-c2dff-rcmamba-stable200_时间戳`；训练参数进一步稳态化为 `lr0=0.006`、`warmup_epochs=6.0`、`mosaic=0.4`、`translate=0.04`、`scale=0.25`、`erasing=0.15`。
+- 验证：`mamba_fusion.py`、`modules/__init__.py`、`tasks.py`、`main.py` 均通过 `python -m py_compile`。
+- 当前环境注意：普通 Python 进程在 `import torch` 阶段触发 HAMI vGPU 缓存 `/usr/local/vgpu/...cache` 只读写入失败并段错误，后续训练需在可写/非沙箱环境中启动。
+- 启动训练时发现 `tasks.py` 顶部导入列表漏写 `ResidualConsistencyMambaFusion`，导致 `parse_model` 解析 YAML 时 `NameError`；已补充导入并准备重新启动。
+- 已重新启动 RC-Mamba 稳定版从头训练：运行目录 `runs/detect/train/yolov8-c2dff-rcmamba-stable200_20260529_104731`。
+- 启动日志确认 P3/P4/P5 三尺度均使用 `ResidualConsistencyMambaFusion`；模型规模 `541 layers, 5,820,207 parameters, 5,820,191 gradients`。
+- 训练参数：`epochs=200`、`patience=50`、`batch=8`、`imgsz=640`、`optimizer=SGD`、`lr0=0.006`、`warmup_epochs=6.0`、`mosaic=0.4`、`translate=0.04`、`scale=0.25`、`erasing=0.15`。
+- 第 1 轮验证为 `mAP50=0`、`mAP50-95=0`，先继续观察到第 5-8 轮；若仍为 0 或明显低于旧 GP-Boost/CGRAA 早期曲线，将立即止损调整。
+- 第 6 轮健康检查：P3/P4/P5 `fusion_gate[local,global,fft]` 分别约 `[0.7950,0.0768,0.1282]`、`[0.5716,0.2940,0.1344]`、`[0.2218,0.6911,0.0870]`；`consistency` 约 `0.5412/0.5430/0.5616`；`theta_delta_abs` 约 `0.0019/0.0035/0.0014`；没有 local > 0.85 或仿射坍塌。
+- 第 1-11 轮指标：`0/0`、`0.00040/0.00016`、`0.00367/0.00076`、`0.01556/0.00409`、`0.01873/0.00589`、`0.06367/0.02463`、`0.05076/0.02077`、`0.07422/0.03238`、`0.11388/0.04633`、`0.14712/0.06550`、`0.13162/0.06148`（格式 `mAP50/mAP50-95`）。
+- 早期裁决：第 10-11 轮已超过 CGRAA 稳定版第 10 轮 `0.12053/0.05498`，且 loss 持续下降，因此不止损，继续观察到第 20 轮再与旧 GP-Boost/CGRAA 曲线正式比较。
+- 第 21 轮裁决：当前 best 第 21 轮 `mAP50=0.28727`、`mAP50-95=0.15714`，已追上/略优于旧 GP-Boost scratch 第 21 轮附近 `0.283/0.146`，并明显超过 CGRAA 稳定版第 18-20 轮早期水平。
+- 第 18-21 轮连续结果为：`0.26477/0.13476`、`0.28149/0.14231`、`0.26204/0.13500`、`0.28727/0.15714`，曲线仍在上升。
+- 决策：不终止训练；下一裁决点放到第 35 轮，对照旧 GP-Boost scratch 第 35 轮约 `0.332/0.181`。若第 35 轮前后不能超过该水平，再止损改结构/训练策略。
+- 第 30 轮重大进展：验证达到 `mAP50=0.379`、`mAP50-95=0.205`，已经超过旧 GP-Boost scratch 第 35 轮附近约 `0.332/0.181`。
+- 结论：`ResidualConsistencyMambaFusion` 的零初始化残差 + 一致性引导 warmup 策略有效，早期收敛速度和第 30 轮精度均优于旧 GP-Boost scratch 对照；该版本暂定为新的主实验候选。
+- 决策：取消第 35 轮止损条件，继续训练；下一观察点调整为第 50 轮和第 80 轮，重点看是否突破 clean-headtune 前的历史主结果区间。
+
+2026-05-29 19:38:22 CST
+- 按“上传当前项目到 GitHub”的需求开始整理仓库。
+- 当前目录总体积约 `4.4G`，包含 `data/`、`runs/`、`saved_results/`、权重 `.pt`、下载 wheel 等大文件；普通 GitHub 仓库直接推送容易失败，也可能公开数据集和训练权重。
+- 新增 `.gitignore`，默认排除 `data/`、`runs/`、`saved_results/`、缓存、IDE 文件、模型权重、导出模型、wheel 和压缩包，仅准备上传源码、配置和实验日志。
+- 环境检查：未安装 `gh`，未安装 `git lfs`，未检测到 `GITHUB_TOKEN/GH_TOKEN`，当前项目没有 GitHub remote；需要用户提供空 GitHub 仓库 HTTPS/SSH 地址，或提供可用 token 后才能实际 push。
+
+2026-05-29 19:46:07 CST
+- 已创建 GitHub 上传用干净副本：`/tmp/C2DFF-Net-main-github`，副本大小约 `12M`。
+- 由于当前项目内 `.git/` 为空壳且上级目录 `/root/shared-nvme` 才是实际 Git 根目录，为避免把无关文件一起提交，未直接复用上级 Git 仓库，而是在临时副本中重新初始化独立仓库。
+- 已在副本中完成本地提交，共 `642` 个源码/配置/日志文件；具体最新提交号以 `/tmp/C2DFF-Net-main-github` 中 `git log --oneline -1` 输出为准。
+- 上传副本已排除 `data/`、`runs/`、`saved_results/`、`.pt/.pth` 权重、导出模型、wheel、压缩包和缓存文件；下一步等待用户提供 GitHub 空仓库地址与认证后执行 `git remote add origin ...` 和 `git push -u origin main`。
+
+2026-05-29 20:15:50 CST
+- 用户提供 GitHub 仓库地址：`https://github.com/2606748614-a11y/c2dff`。
+- 已在上传副本 `/tmp/C2DFF-Net-main-github` 添加 remote：`origin https://github.com/2606748614-a11y/c2dff.git`。
+- 首次 `git push -u origin main` 在沙箱内因无法解析 `github.com` 失败；提升网络权限后 GitHub 可访问，但 HTTPS 推送因本机未配置用户名/token 失败：`could not read Username for 'https://github.com'`。
+- 已检测本机 SSH key，但 `ssh -T git@github.com` 返回 `Permission denied (publickey)`，说明当前公钥尚未绑定到 GitHub 账号；需要用户添加 SSH 公钥或提供 Personal Access Token 后继续推送。

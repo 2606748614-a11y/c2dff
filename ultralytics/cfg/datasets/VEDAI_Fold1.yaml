@@ -1,0 +1,38 @@
+#path: G:/KeYan/DATA/VEDAI_fold01
+#train: G:/KeYan/DATA/VEDAI_fold01/images/train
+#train_infrared: G:/KeYan/DATA/VEDAI_fold01/image/train
+#val: G:/KeYan/DATA/VEDAI_fold01/images/test
+#val_infrared: G:/KeYan/DATA/VEDAI_fold01/image/test
+#test: G:/KeYan/DATA/VEDAI_fold01/images/test
+#test_infrared: G:/KeYan/DATA/VEDAI_fold01/image/test
+#number of classes
+#nc: 8
+#
+##classes names
+##names: ['car', 'pickup', 'camping','truck', 'other', 'tractor', 'boat', 'van','plane']
+#names: ['car', 'truck', 'pickup', 'tractor', 'camper', 'boat', 'van', 'other'] #PR那个的划分（8类）
+
+
+
+path: E:/MUL/ultralytics/Datasets/VEDAI_1024_8/
+train: E:/MUL/ultralytics/Datasets/VEDAI_1024_8/images/train
+train_infrared: E:/MUL/ultralytics/Datasets/VEDAI_1024_8/image/train
+val: E:/MUL/ultralytics/Datasets/VEDAI_1024_8/images/test
+val_infrared: E:/MUL/ultralytics/Datasets/VEDAI_1024_8/image/test
+test: E:/MUL/ultralytics/Datasets/VEDAI_1024_8/images/test
+test_infrared: E:/MUL/ultralytics/Datasets/VEDAI_1024_8/image/test
+
+#path: G:/KeYan/DATA/VEDAI_1024/
+#train: G:/KeYan/DATA/VEDAI_1024/images/train
+#train_infrared: G:/KeYan/DATA/VEDAI_1024/image/train
+#val: G:/KeYan/DATA/VEDAI_1024/images/test
+#val_infrared: G:/KeYan/DATA/VEDAI_1024/image/test
+#test: G:/KeYan/DATA/VEDAI_1024/images/test
+#test_infrared: G:/KeYan/DATA/VEDAI_1024/image/test
+#number of classes
+nc: 8
+
+#classes names
+#names: ['car', 'pickup', 'camping','truck', 'other', 'tractor', 'boat', 'van','plane'] #9类
+#names: ['car', 'truck', 'pickup', 'tractor', 'camper', 'boat', 'van', 'other'] #PR那个的划分（8类） 不对 没有boat
+names: ['car', 'pickup', 'camping','truck', 'other', 'tractor', 'boat', 'van'] #8类

@@ -1,0 +1,69 @@
+# Ultralytics YOLO 🚀, AGPL-3.0 license
+# YOLOv8 C2DFF with residual consistency-guided Mamba fusion.
+
+ch: 6
+nc: 1
+scales:
+   n: [0.33, 0.25, 1024]
+
+backbone:
+  - [-1, 1, IN, []]
+  - [-1, 1, Multiin, [1]]
+  - [-2, 1, Multiin, [2]]
+
+  - [1, 1, Conv, [64, 3, 2]]
+  - [-1, 1, Conv, [128, 3, 2]]
+  - [-1, 3, C2f, [128, True]]
+  - [2, 1, Conv, [64, 3, 2]]
+  - [-1, 1, Conv, [128, 3, 2]]
+  - [-1, 3, C2f, [128, True]]
+
+  - [5, 1, Conv, [256, 3, 2]]
+  - [8, 1, Conv, [256, 3, 2]]
+  - [-2, 6, C2f, [256, True]]
+  - [-2, 6, C2f, [256, True]]
+  - [[-2, -1], 1, CPCA_CF, [512, 256]]
+  - [[-3, 13], 1, FeatureAdd, []]
+  - [[-3, 13], 1, FeatureAdd, []]
+
+  - [-2, 1, Conv, [512, 3, 2]]
+  - [-2, 1, Conv, [512, 3, 2]]
+  - [-2, 6, C2f, [512, True]]
+  - [-2, 6, C2f, [512, True]]
+  - [[-2, -1], 1, CPCA_CF, [512, 256]]
+  - [[-3, 20], 1, FeatureAdd, []]
+  - [[-3, 20], 1, FeatureAdd, []]
+
+  - [-2, 1, Conv, [1024, 3, 2]]
+  - [-2, 1, Conv, [1024, 3, 2]]
+  - [-2, 3, C2f, [1024, True]]
+  - [-2, 3, C2f, [1024, True]]
+  - [[-2, -1], 1, CPCA_CF, [2048, 1024]]
+  - [[-3, 27], 1, FeatureAdd, []]
+  - [[-3, 27], 1, FeatureAdd, []]
+
+  - [-2, 1, SPPF, [1024, 5]]
+  - [-2, 1, SPPF, [1024, 5]]
+
+  - [[14, 15], 1, ResidualConsistencyMambaFusion, [256, p3]]
+  - [[21, 22], 1, ResidualConsistencyMambaFusion, [512, p4]]
+  - [[30, 31], 1, ResidualConsistencyMambaFusion, [1024, p5]]
+
+head:
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]
+  - [[-1, 33], 1, Concat, [1]]
+  - [-1, 3, C2f, [512]]
+
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]
+  - [[-1, 32], 1, Concat, [1]]
+  - [-1, 3, C2f, [256]]
+
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 37], 1, Concat, [1]]
+  - [-1, 3, C2f, [512]]
+
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [[-1, 34], 1, Concat, [1]]
+  - [-1, 3, C2f, [1024]]
+
+  - [[40, 43, 46], 1, Detect, [nc]]

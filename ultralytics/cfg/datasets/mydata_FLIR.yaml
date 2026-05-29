@@ -1,0 +1,27 @@
+# Train/val/test sets as 1) dir: path/to/imgs, 2) file: path/to/imgs.txt, or 3) list: [path/to/imgs1, path/to/imgs2, ..]
+#path: /home/andrewuuu/Code_Sources/Multispectral Pedestrian Detection/mutiYOLOv8/Datasets/kaist  # dataset root dir
+#path: /home/seucar/LiuZhichao/multiYolov8/Datasets/kaist  # dataset root dir
+#path: Datasets/llvip  # dataset root dir
+## 下面这些路径是固定的，都不要改，只改上面的'path'
+#train: images/train  # train images (relative to 'path') 128 images
+#train_infrared: image/train  # 红外图路径
+#val: images/test  # val images (relative to 'path'llvip) 128 images
+#test:  # test images (optional)
+## Classes
+#names:
+#  0: person
+
+#path: Datasets/VEDAI_1024_9
+train: E:/MUL/ultralytics/Datasets/FLIR_align_3class/images/train
+train_infrared: E:/MUL/ultralytics/Datasets/FLIR_align_3class/image/train
+val: E:/MUL/ultralytics/Datasets/FLIR_align_3class/images/test
+val_infrared: E:/MUL/ultralytics/Datasets/FLIR_align_3class/image/test
+test: E:/MUL/ultralytics/Datasets/FLIR_align_3class/images/test
+test_infrared: E:/MUL/ultralytics/Datasets/FLIR_align_3class/image/test
+
+
+#number of classes
+nc: 3
+
+#classes names
+names: ['person','car','bicycle']

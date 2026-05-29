@@ -1,0 +1,42 @@
+# Runtime artifacts
+__pycache__/
+*.py[cod]
+*.log
+.ipynb_checkpoints/
+.pytest_cache/
+.cache/
+
+# IDE and local environment files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Datasets and generated training outputs
+data/
+runs/
+saved_results/
+
+# Model weights and binary exports
+*.pt
+*.pth
+*.onnx
+*.engine
+*.tflite
+*.pb
+*.mlmodel
+*.torchscript
+
+# Local downloaded wheels/install artifacts
+*.whl
+=1.4.0
+=2.0.0
+
+# Large archives
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z

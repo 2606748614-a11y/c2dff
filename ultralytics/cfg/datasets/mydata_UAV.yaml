@@ -1,0 +1,12 @@
+#path: ../data
+train_infrared: E:\MUL\ultralytics\Datasets\car_tgrs\image\train
+train: E:\MUL\ultralytics\Datasets\car_tgrs\images\train
+val_infrared: E:\MUL\ultralytics\Datasets\car_tgrs\image\val
+val: E:\MUL\ultralytics\Datasets\car_tgrs\images\val
+test_infrared: E:\MUL\ultralytics\Datasets\car_tgrs\image\val
+test: E:\MUL\ultralytics\Datasets\car_tgrs\images\val
+#number of classes
+nc: 1
+
+#classes names
+names: ['car']
