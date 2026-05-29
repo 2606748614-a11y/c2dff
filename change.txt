@@ -448,3 +448,8 @@
 - 已在上传副本 `/tmp/C2DFF-Net-main-github` 添加 remote：`origin https://github.com/2606748614-a11y/c2dff.git`。
 - 首次 `git push -u origin main` 在沙箱内因无法解析 `github.com` 失败；提升网络权限后 GitHub 可访问，但 HTTPS 推送因本机未配置用户名/token 失败：`could not read Username for 'https://github.com'`。
 - 已检测本机 SSH key，但 `ssh -T git@github.com` 返回 `Permission denied (publickey)`，说明当前公钥尚未绑定到 GitHub 账号；需要用户添加 SSH 公钥或提供 Personal Access Token 后继续推送。
+
+2026-05-29 20:37:17 CST
+- 用户将本机 SSH 公钥添加到 GitHub 后，使用指定 key `~/.ssh/id_ed25519` 测试通过，GitHub 返回 `Hi 2606748614-a11y!`。
+- 已将上传副本 remote 切换为 SSH：`git@github.com:2606748614-a11y/c2dff.git`。
+- 已成功执行 `git push -u origin main`，远端新建并跟踪 `main` 分支；项目源码快照已上传到 `https://github.com/2606748614-a11y/c2dff`。
